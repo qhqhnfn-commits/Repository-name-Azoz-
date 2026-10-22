@@ -1,156 +1,172 @@
-import telebot
-from telebot import types
-import time
+import logging
+import sqlite3
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    CallbackQueryHandler
+)
 
-TOKEN = "8875012329:AAFU2kEazYkXzxukKFBJ5hReGb9pDoOWlzk"
-bot = telebot.TeleBot(TOKEN)
+BOT_TOKEN = "8875012329:AAFU2kEazYkXzxukKFBJ5hReGb9pDoOWlzk"
+CHANNEL_USERNAME = "@fewcce"
+CHANNEL_ID = -1002345678901
 
-TARGET_CHANNEL = "@fewcce"
-ADMIN_ID = 123456789 
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 
-users_data = {}
+def init_db():
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            points INTEGER DEFAULT 0,
+            referred_by INTEGER
+        )
+    ''')
+    conn.commit()
+    conn.close()
 
 def get_user(user_id):
-    if user_id not in users_data:
-        users_data[user_id] = {
-            "points": 10,
-            "referred": 0,
-            "orders": [],
-            "last_claim": 0
-        }
-    return users_data[user_id]
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT points, referred_by FROM users WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row
 
-@bot.message_handler(commands=['start'])
-def send_welcome(message):
-    user_id = message.from_user.id
-    user = get_user(user_id)
+def add_user(user_id, referred_by=None):
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR IGNORE INTO users (user_id, points, referred_by) VALUES (?, 0, ?)", (user_id, referred_by))
+    conn.commit()
+    conn.close()
+
+def add_points(user_id, points_to_add):
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET points = points + ? WHERE user_id = ?", (points_to_add, user_id))
+    conn.commit()
+    conn.close()
+
+def get_leaderboard():
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id, points FROM users ORDER BY points DESC LIMIT 5")
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
+async def is_user_subscribed(bot, user_id: int) -> bool:
+    try:
+        member = await bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
+        return member.status in ['creator', 'administrator', 'member']
+    except Exception as e:
+        logging.error(f"Error checking sub: {e}")
+        return True
+
+async def send_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    bot_username = (await context.bot.get_me()).username
+    ref_link = f"https://t.me/{bot_username}?start={user_id}"
     
-    args = message.text.split()
-    if len(args) > 1:
-        try:
-            ref_id = int(args[1])
-            if ref_id != user_id and ref_id in users_data:
-                users_data[ref_id]["points"] += 5
-                users_data[ref_id]["referred"] += 1
+    user_data = get_user(user_id)
+    points = user_data[0] if user_data else 0
+
+    msg = (
+        f"أهلاً بك في بوت زيادة التفاعل والمشاركات! 🔥\n\n"
+        f"📊 عدد نقاطك الحالي: {points} نقطة\n"
+        f"🔗 رابط الدعوة الخاص بك:\n{ref_link}\n\n"
+        f"انشر الرابط واحصل على 10 نقاط لكل شخص يشترك!"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("🏆 قائمة المتصدرين", callback_data="leaderboard")],
+        [InlineKeyboardButton("🎁 استبدال النقاط", callback_data="redeem")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if update.callback_query:
+        await update.callback_query.message.edit_text(msg, reply_markup=reply_markup)
+    else:
+        await update.message.reply_text(msg, reply_markup=reply_markup)
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    user_id = user.id
+    args = context.args
+
+    user_data = get_user(user_id)
+    if not user_data:
+        referrer_id = None
+        if args and args[0].isdigit():
+            possible_ref = int(args[0])
+            if possible_ref != user_id and get_user(possible_ref):
+                referrer_id = possible_ref
+                add_points(referrer_id, 10)
                 try:
-                    bot.send_message(ref_id, "🎉 **مكافأة إحالة قوية!** دخل شخص عن طريق رابطك وحصلت على **5 نقاط** إضافية!", parse_mode="Markdown")
-                except:
+                    await context.bot.send_message(
+                        chat_id=referrer_id,
+                        text="🎉 دخل شخص جديد عن طريق رابطك! حصلت على 10 نقاط."
+                    )
+                except Exception:
                     pass
-        except ValueError:
-            pass
+        add_user(user_id, referrer_id)
 
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    btn_boost = types.KeyboardButton("🚀 دعم وتفاعل خارق")
-    btn_profile = types.KeyboardButton("👤 حسابي ونقاطي")
-    btn_ref = types.KeyboardButton("🔗 رابط الإحالة (نقاط مجانية)")
-    btn_daily = types.KeyboardButton("🎁 المكافأة اليومية")
-    btn_info = types.KeyboardButton("ℹ️ الشروط والتعليمات")
-    
-    markup.add(btn_boost)
-    markup.add(btn_profile, btn_ref)
-    markup.add(btn_daily, btn_info)
-    
-    welcome_text = (
-        f"🔥 **أهلاً بك في بوت التفاعل الأسطوري لقناة {TARGET_CHANNEL}!**\n\n"
-        "⚡ يقدم لك البوت أفضل وأسرع خدمات زيادة التفاعل، المشاهدات، والمشتركين بدقة وعالية الأمان بدون أي حظر (Anti-Ban).\n\n"
-        "🎁 حصلت على **10 نقاط مجانية** كهدية ترحيبية!"
-    )
-    bot.send_message(message.chat.id, welcome_text, reply_markup=markup, parse_mode="Markdown")
-
-@bot.message_handler(func=lambda m: m.text == "🎁 المكافأة اليومية")
-def daily_reward(message):
-    user_id = message.from_user.id
-    user = get_user(user_id)
-    current_time = time.time()
-    
-    if current_time - user["last_claim"] >= 86400:
-        user["points"] += 3
-        user["last_claim"] = current_time
-        bot.send_message(message.chat.id, "🎉 **تم إعطاؤك 3 نقاط مجانية لمكافأتك اليومية!** ارجع بكرة واطلبها مرة ثانية.")
-    else:
-        remaining = int((86400 - (current_time - user["last_claim"])) / 3600)
-        bot.send_message(message.chat.id, f"⏳ لقد أخذت المكافأة اليومية مسبقاً! تعال بعد **{remaining} ساعة**.")
-
-@bot.message_handler(func=lambda m: m.text == "👤 حسابي ونقاطي")
-def my_profile(message):
-    user_id = message.from_user.id
-    user = get_user(user_id)
-    
-    msg = (
-        f"📊 **معلومات حسابك والتفاعل:**\n\n"
-        f"🔹 نقاطك الحالية: `{user['points']}` نقطة\n"
-        f"👥 عدد إحالاتك: `{user['referred']}` شخص\n"
-        f"📦 الطلبات المكتملة: `{len(user['orders'])}` طلب\n"
-    )
-    bot.send_message(message.chat.id, msg, parse_mode="Markdown")
-
-@bot.message_handler(func=lambda m: m.text == "🔗 رابط الإحالة (نقاط مجانية)")
-def ref_link(message):
-    user_id = message.from_user.id
-    bot_info = bot.get_me()
-    link = f"https://t.me/{bot_info.username}?start={user_id}"
-    
-    msg = (
-        f"🚀 **انشر رابطك واجمع نقاط بلا حدود!**\n\n"
-        f"كل شخص يدخل من رابطك تحسب لك **5 نقاط** مباشرة!\n\n"
-        f"🔗 رابطك الخاص:\n`{link}`"
-    )
-    bot.send_message(message.chat.id, msg, parse_mode="Markdown")
-
-@bot.message_handler(func=lambda m: m.text == "🚀 دعم وتفاعل خارق")
-def boost_store(message):
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    
-    btn1 = types.InlineKeyboardButton("👁️ زيادة مشاهدات (500 مشاهدة = 10 نقاط)", callback_data="buy_views")
-    btn2 = types.InlineKeyboardButton("🔥 زيادة تفاعل ومشاعر (50 تفاعل = 15 نقطة)", callback_data="buy_reactions")
-    btn3 = types.InlineKeyboardButton("👥 زيادة أعضاء للقناة (20 عضو = 25 نقطة)", callback_data="buy_subscribers")
-    
-    markup.add(btn1, btn2, btn3)
-    
-    bot.send_message(message.chat.id, "🎯 **اختر نوع الخدمة المطلوبة لقناتك:**", reply_markup=markup)
-
-@bot.callback_query_handler(func=lambda call: True)
-def callback_query(call):
-    user_id = call.from_user.id
-    user = get_user(user_id)
-    
-    if call.data == "buy_views":
-        cost = 10
-        service = "500 مشاهدة للمنشورات"
-    elif call.data == "buy_reactions":
-        cost = 15
-        service = "50 تفاعل ومشاعر (Reactions)"
-    elif call.data == "buy_subscribers":
-        cost = 25
-        service = "20 مشترك حقيقي"
-    else:
+    subscribed = await is_user_subscribed(context.bot, user_id)
+    if not subscribed:
+        keyboard = [
+            [InlineKeyboardButton("📢 اشترك في القناة أولاً", url=f"https://t.me/{CHANNEL_USERNAME.replace('@', '')}")],
+            [InlineKeyboardButton("✅ تحقق من الاشتراك", callback_data="check_sub")]
+        ]
+        await update.message.reply_text(
+            f"مرحباً بك يا {user.first_name}!\n\nلاستخدام البوت، اشترك في القناة أولاً:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
         return
 
-    if user["points"] < cost:
-        bot.answer_callback_query(call.id, f"❌ نقاطك غير كافية! تحتاج {cost} نقطة.", show_alert=True)
-    else:
-        user["points"] -= cost
-        user["orders"].append(service)
+    await send_main_menu(update, context)
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "check_sub":
+        subscribed = await is_user_subscribed(context.bot, query.from_user.id)
+        if subscribed:
+            await send_main_menu(update, context)
+        else:
+            await query.answer("❌ لم تشترك بعد! يرجى الاشتراك في القناة أولاً.", show_alert=True)
+
+    elif query.data == "leaderboard":
+        top_users = get_leaderboard()
+        text = "🏆 **قائمة المتصدرين:**\n\n"
+        if not top_users:
+            text += "لا يوجد متصدرين حالياً."
+        else:
+            for idx, (u_id, pts) in enumerate(top_users, 1):
+                text += f"{idx}. المستخدم `{u_id}` - {pts} نقطة\n"
         
-        bot.answer_callback_query(call.id, "✅ تم تسجيل طلبك بنجاح!")
-        bot.send_message(
-            call.message.chat.id, 
-            f"✅ **تم إنشاء الطلب بنجاح!**\n\n"
-            f"📌 **الخدمة:** {service}\n"
-            f"🎯 **القناة Target:** {TARGET_CHANNEL}\n"
-            f"📉 **النقاط المتبقية:** {user['points']} نقطة\n\n"
-            f"⚡ جاري تنفيذ التفاعل بشكل آمن وآلي خلال دقائق..."
-        )
+        keyboard = [[InlineKeyboardButton("🔙 العودة للقائمة الرئيسية", callback_data="main_menu")]]
+        await query.message.edit_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
 
-@bot.message_handler(func=lambda m: m.text == "ℹ️ الشروط والتعليمات")
-def info_sec(message):
-    text = (
-        "🛡️ **نظام الحماية والأمان:**\n"
-        "- جميع الخدمات تنفذ بتدفق منتظم لمنع الحظر آلياً.\n"
-        "- لا تقم بإنشاء طلبات متكررة في نفس الثانية تفادياً لضغط السيرفر.\n"
-        "- جمع النقاط مجاني 100% عبر الإحالات والمكافآت."
-    )
-    bot.send_message(message.chat.id, text, parse_mode="Markdown")
+    elif query.data == "redeem":
+        text = "🎁 **قسم استبدال النقاط:**\n\nتواصل مع الإدارة لاستبدال نقاطك بجوائز!"
+        keyboard = [[InlineKeyboardButton("🔙 العودة للقائمة الرئيسية", callback_data="main_menu")]]
+        await query.message.edit_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
 
-print("OP Bot Status: ONLINE & ACTIVE")
-bot.infinity_polling(timeout=10, long_polling_timeout=5)
+    elif query.data == "main_menu":
+        await send_main_menu(update, context)
+
+if __name__ == '__main__':
+    init_db()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(button_handler))
+
+    logging.info("Starting bot...")
+    app.run_polling()
